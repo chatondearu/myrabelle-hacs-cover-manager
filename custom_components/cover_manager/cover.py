@@ -136,6 +136,21 @@ class CoverManagerCover(CoverEntity, RestoreEntity):
             return STATE_CLOSING
         return STATE_OPEN if self.current_cover_position > 0 else STATE_CLOSED
 
+    @property
+    def icon(self) -> str:
+        """Return the icon based on state and position."""
+        if self._direction == "opening":
+            return "mdi:arrow-up-bold"
+        if self._direction == "closing":
+            return "mdi:arrow-down-bold"
+        # Idle state: reflect actual position
+        pos = self.current_cover_position
+        if pos == 0:
+            return "mdi:window-shutter"
+        if pos == 100:
+            return "mdi:window-shutter-open"
+        return "mdi:window-shutter-alert"
+
     async def _trigger_pulse(self) -> None:
         self._ignore_next_impulse = True
         try:
@@ -146,7 +161,7 @@ class CoverManagerCover(CoverEntity, RestoreEntity):
         finally:
             self._ignore_next_impulse = False
 
-    def _stop_movement(self, update_position: bool = True) -> None:
+    def _stop_movement(self, update_position: bool = True, cancel_task: bool = True) -> None:
         if self._direction in ("opening", "closing") and self._movement_start_time and update_position:
             elapsed = time.monotonic() - self._movement_start_time
             delta = (elapsed / self._travel_time) * 100
@@ -157,11 +172,16 @@ class CoverManagerCover(CoverEntity, RestoreEntity):
         self._direction = "idle"
         self._movement_start_time = None
         self._start_position = self._position
-        if self._update_task:
+        if cancel_task and self._update_task:
             self._update_task.cancel()
             self._update_task = None
         self.async_write_ha_state()
         self._notify_sub_entities()
+
+    async def _stop_and_pulse(self, update_position: bool = True) -> None:
+        """Stop movement, update position if requested, and send a pulse to stop physically."""
+        self._stop_movement(update_position=update_position, cancel_task=False)
+        await self._trigger_pulse()
 
     async def _movement_loop(self) -> None:
         try:
@@ -175,7 +195,7 @@ class CoverManagerCover(CoverEntity, RestoreEntity):
                     self._position = max(0.0, self._start_position - delta)
 
                 if self._position <= 0.0 or self._position >= 100.0:
-                    self._stop_movement(update_position=False)
+                    await self._stop_and_pulse(update_position=False)
                     break
 
                 self.async_write_ha_state()
@@ -224,8 +244,7 @@ class CoverManagerCover(CoverEntity, RestoreEntity):
         # If already stopped, do nothing
         if self._direction == "idle":
             return
-        self._stop_movement(update_position=True)
-        await self._trigger_pulse()
+        await self._stop_and_pulse(update_position=True)
 
     async def async_set_cover_position(self, **kwargs: Any) -> None:
         target = max(0, min(100, int(kwargs[ATTR_POSITION])))
@@ -296,7 +315,7 @@ class CoverManagerCover(CoverEntity, RestoreEntity):
                     return
                 remaining = abs(target - self._position)
                 if remaining == 0:
-                    self._stop_movement(update_position=False)
+                    self._stop_movement(update_position=False, cancel_task=False)
                     return
                 start_time = time.monotonic()
                 total_duration = self._travel_time * (remaining / 100)
@@ -308,7 +327,7 @@ class CoverManagerCover(CoverEntity, RestoreEntity):
                     else:
                         self._position = self._start_position - remaining * progress
                     if progress >= 1.0:
-                        self._stop_movement(update_position=False)
+                        await self._stop_and_pulse(update_position=False)
                         break
                     self.async_write_ha_state()
                     self._notify_sub_entities()
@@ -334,13 +353,14 @@ class CoverManagerTravelTime(NumberEntity):
     _attr_native_min_value = 1
     _attr_native_max_value = 300
     _attr_native_step = 1
+    _attr_native_unit_of_measurement = "s"
     _attr_mode = NumberMode.BOX
     _attr_has_entity_name = True
 
     def __init__(self, entry: ConfigEntry, cover: CoverManagerCover) -> None:
         self._cover = cover
         self._attr_unique_id = f"{entry.entry_id}_travel_time"
-        self._attr_name = f"{entry.data['name']} Travel Time"
+        self._attr_name = "Travel Time"
         self._attr_device_info = cover.device_info
 
     @property
@@ -357,13 +377,14 @@ class CoverManagerPosition(NumberEntity):
     _attr_native_min_value = 0
     _attr_native_max_value = 100
     _attr_native_step = 1
+    _attr_native_unit_of_measurement = "%"
     _attr_mode = NumberMode.BOX
     _attr_has_entity_name = True
 
     def __init__(self, entry: ConfigEntry, cover: CoverManagerCover) -> None:
         self._cover = cover
         self._attr_unique_id = f"{entry.entry_id}_position_ctl"
-        self._attr_name = f"{entry.data['name']} Position"
+        self._attr_name = "Position"
         self._attr_device_info = cover.device_info
 
     @property
@@ -371,7 +392,7 @@ class CoverManagerPosition(NumberEntity):
         return float(self._cover.current_cover_position)
 
     async def async_set_native_value(self, value: float) -> None:
-        await self._cover.async_set_cover_position(position=int(value))
+        await self._cover.async_set_cover_position(**{ATTR_POSITION: int(value)})
 
 
 class CoverManagerDirection(SelectEntity):
@@ -383,7 +404,7 @@ class CoverManagerDirection(SelectEntity):
     def __init__(self, entry: ConfigEntry, cover: CoverManagerCover) -> None:
         self._cover = cover
         self._attr_unique_id = f"{entry.entry_id}_direction_ctl"
-        self._attr_name = f"{entry.data['name']} Direction"
+        self._attr_name = "Direction"
         self._attr_device_info = cover.device_info
 
     @property
@@ -393,4 +414,9 @@ class CoverManagerDirection(SelectEntity):
     async def async_select_option(self, option: str) -> None:
         if option not in self._attr_options:
             return
-        self._cover.update_direction(option)
+        if option == "idle":
+            # Stop the cover if idle is selected
+            await self._cover.async_stop_cover()
+        else:
+            # Start movement in the selected direction
+            await self._cover._go_direction(option)
